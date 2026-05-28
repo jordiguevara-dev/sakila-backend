@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from supabase import create_client
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from datetime import datetime
 
 load_dotenv()
 
@@ -36,10 +37,8 @@ def inicio():
 # 1. VER INVENTARIO COMPLETO CON NOMBRES Y PRECIOS REALES
 @app.get("/inventory")
 def listar_inventario():
-    # Jalamos el catálogo con el join de film para traer título y tarifa real
     query = supabase.table("inventory").select("inventory_id, available, store_id, film(title, rental_rate)").execute()
     
-    # Formateamos la respuesta en un JSON plano para que Java lo lea súper fácil sin romperse
     lista_plana = []
     for item in query.data:
         lista_plana.append({
@@ -69,17 +68,16 @@ def listar_clientes():
 # 3. REGISTRAR UN NUEVO ALQUILER REAL
 @app.post("/rentals")
 def crear_alquiler(rental: Rental):
-    # Validar inventario existente
     inventario = supabase.table("inventory").select("inventory_id, available, film(title)").eq("inventory_id", rental.inventory_id).execute()
     if not inventario.data:
         return {"error": "El ID de inventario no existe"}
     
     inv_data = inventario.data[0]
     if inv_data["available"] == False:
-        return {"error": f"La película '{inv_data['film']['title']}' NO está disponible"}
+        return {"error": f"La película NO está disponible"}
 
     # Registrar el alquiler en la tabla rental de Supabase
-    nuevo = supabase.table("rental").insert({
+    supabase.table("rental").insert({
         "inventory_id": rental.inventory_id,
         "customer_id": rental.customer_id,
         "staff_id": rental.staff_id
@@ -88,25 +86,30 @@ def crear_alquiler(rental: Rental):
     # Cambiar estado físico en inventario a NO disponible (false)
     supabase.table("inventory").update({"available": False}).eq("inventory_id", rental.inventory_id).execute()
 
-    return {"mensaje": "Alquiler procesado exitosamente"}
+    # Formato plano para que el done() de Java lea HTTP 200 de forma limpia
+    return {"status": "success"}
 
 # 4. PROCESAR UNA DEVOLUCIÓN MEDIANTE EL ID DEL ALQUILER (RENTAL ID)
 @app.put("/returns/{rental_id}")
 def devolver_pelicula(rental_id: int):
-    rental = supabase.table("rental").select("inventory_id").eq("rental_id", rental_id).execute()
-    if not rental.data:
+    rental_query = supabase.table("rental").select("inventory_id").eq("rental_id", rental_id).execute()
+    if not rental_query.data:
         return {"error": "ID de alquiler no encontrado"}
     
-    inv_id = rental.data[0]["inventory_id"]
+    inv_id = rental_query.data[0]["inventory_id"]
 
-    # Liberar el inventario (disponible = true)
+    # Liberar el inventario (available = true)
     supabase.table("inventory").update({"available": True}).eq("inventory_id", inv_id).execute()
-    return {"mensaje": "La película ha sido devuelta y liberada con éxito"}
+    
+    # Registrar marca de tiempo en formato ISO estándar compatible con Postgres
+    fecha_actual = datetime.utcnow().isoformat()
+    supabase.table("rental").update({"return_date": fecha_actual}).eq("rental_id", rental_id).execute()
+    
+    return {"status": "success"}
 
 # 5. REGISTRAR PAGO REAL EN LA TABLA PAYMENT
 @app.post("/payments")
 def crear_pago(payment: Payment):
-    # Buscar a qué cliente le corresponde ese alquiler para guardar su historial
     rental = supabase.table("rental").select("customer_id, staff_id").eq("rental_id", payment.rental_id).execute()
     if not rental.data:
         return {"error": "El ID de alquiler no registra transacciones"}
@@ -114,7 +117,6 @@ def crear_pago(payment: Payment):
     c_id = rental.data[0]["customer_id"]
     s_id = rental.data[0]["staff_id"]
 
-    # Insertar en la tabla payment
     supabase.table("payment").insert({
         "customer_id": c_id,
         "staff_id": s_id,
@@ -122,7 +124,7 @@ def crear_pago(payment: Payment):
         "amount": payment.amount
     }).execute()
 
-    return {"mensaje": "Pago registrado en caja"}
+    return {"status": "success"}
 
 # 6. AGREGAR CLIENTE DIRECTAMENTE EN SUPABASE DESDE JAVA
 @app.post("/customers")
@@ -134,7 +136,7 @@ def agregar_cliente(customer: CustomerInput):
         "email": customer.email,
         "active": True
     }).execute()
-    return {"mensaje": "Cliente creado con éxito"}
+    return {"status": "success"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
