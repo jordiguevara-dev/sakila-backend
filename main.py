@@ -1,6 +1,7 @@
 import os
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -14,14 +15,23 @@ supabase = create_client(url, key)
 
 app = FastAPI()
 
-# Modelos de Datos Pydantic para validar entradas
+# Buenas Prácticas: Habilitar CORS por si luego conectas un frontend Web (React/Angular)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Modelos Pydantic actualizados
 class Rental(BaseModel):
     inventory_id: int
     customer_id: int
     staff_id: int
 
 class Payment(BaseModel):
-    rental_id: int
+    inventory_id: int  # <-- CAMBIO CLAVE: Usamos inventory_id en lugar de rental_id
     amount: float
 
 class CustomerInput(BaseModel):
@@ -34,10 +44,10 @@ class CustomerInput(BaseModel):
 def inicio():
     return {"status": "Servidor Sakila en la Nube Operativo"}
 
-# 1. VER INVENTARIO COMPLETO CON NOMBRES Y PRECIOS REALES
 @app.get("/inventory")
 def listar_inventario():
-    query = supabase.table("inventory").select("inventory_id, available, store_id, film(title, rental_rate)").execute()
+    # Ordenado por ID para que la tabla en Java no salte de orden al actualizarse
+    query = supabase.table("inventory").select("inventory_id, available, store_id, film(title, rental_rate)").order("inventory_id").execute()
     
     lista_plana = []
     for item in query.data:
@@ -50,10 +60,9 @@ def listar_inventario():
         })
     return lista_plana
 
-# 2. VER TODOS LOS CLIENTES DE SUPABASE EN TIEMPO REAL
 @app.get("/customers")
 def listar_clientes():
-    query = supabase.table("customer").select("customer_id, first_name, last_name, email, active").execute()
+    query = supabase.table("customer").select("customer_id, first_name, last_name, email, active").order("customer_id").execute()
     lista_clientes = []
     for c in query.data:
         lista_clientes.append({
@@ -65,77 +74,54 @@ def listar_clientes():
         })
     return lista_clientes
 
-# 3. REGISTRAR UN NUEVO ALQUILER REAL
 @app.post("/rentals")
 def crear_alquiler(rental: Rental):
-    inventario = supabase.table("inventory").select("inventory_id, available, film(title)").eq("inventory_id", rental.inventory_id).execute()
-    if not inventario.data:
-        return {"error": "El ID de inventario no existe"}
-    
-    inv_data = inventario.data[0]
-    if inv_data["available"] == False:
-        return {"error": f"La película NO está disponible"}
+    inventario = supabase.table("inventory").select("inventory_id, available").eq("inventory_id", rental.inventory_id).execute()
+    if not inventario.data or not inventario.data[0]["available"]:
+        return {"error": "La película NO está disponible o no existe"}
 
-    # Registrar el alquiler en la tabla rental de Supabase
     supabase.table("rental").insert({
         "inventory_id": rental.inventory_id,
         "customer_id": rental.customer_id,
         "staff_id": rental.staff_id
     }).execute()
 
-    # Cambiar estado físico en inventario a NO disponible (false)
     supabase.table("inventory").update({"available": False}).eq("inventory_id", rental.inventory_id).execute()
-
-    # Formato plano para que el done() de Java lea HTTP 200 de forma limpia
     return {"status": "success"}
 
-# 4. PROCESAR UNA DEVOLUCIÓN MEDIANTE EL ID DEL ALQUILER (RENTAL ID)
-@app.put("/returns/{rental_id}")
-def devolver_pelicula(rental_id: int):
-    rental_query = supabase.table("rental").select("inventory_id").eq("rental_id", rental_id).execute()
-    if not rental_query.data:
-        return {"error": "ID de alquiler no encontrado"}
+# CAMBIO CLAVE: Ahora recibe inventory_id
+@app.put("/returns/{inventory_id}")
+def devolver_pelicula(inventory_id: int):
+    # 1. Reestablecer stock físico
+    supabase.table("inventory").update({"available": True}).eq("inventory_id", inventory_id).execute()
     
-    inv_id = rental_query.data[0]["inventory_id"]
-
-    # Liberar el inventario (available = true)
-    supabase.table("inventory").update({"available": True}).eq("inventory_id", inv_id).execute()
+    # 2. Buscar el alquiler activo (el que aún no tiene fecha de retorno) y cerrarlo
+    rentals = supabase.table("rental").select("rental_id").eq("inventory_id", inventory_id).is_("return_date", "null").execute()
     
-    # Registrar marca de tiempo en formato ISO estándar compatible con Postgres
-    fecha_actual = datetime.utcnow().isoformat()
-    supabase.table("rental").update({"return_date": fecha_actual}).eq("rental_id", rental_id).execute()
+    if rentals.data:
+        r_id = rentals.data[0]["rental_id"]
+        fecha_actual = datetime.utcnow().isoformat()
+        supabase.table("rental").update({"return_date": fecha_actual}).eq("rental_id", r_id).execute()
     
     return {"status": "success"}
 
-# 5. REGISTRAR PAGO REAL EN LA TABLA PAYMENT
 @app.post("/payments")
 def crear_pago(payment: Payment):
-    rental = supabase.table("rental").select("customer_id, staff_id").eq("rental_id", payment.rental_id).execute()
-    if not rental.data:
-        return {"error": "El ID de alquiler no registra transacciones"}
+    # Buscar el alquiler más reciente asociado a este inventario
+    rentals = supabase.table("rental").select("rental_id, customer_id, staff_id").eq("inventory_id", payment.inventory_id).order("rental_date", desc=True).limit(1).execute()
     
-    c_id = rental.data[0]["customer_id"]
-    s_id = rental.data[0]["staff_id"]
+    if not rentals.data:
+        return {"error": "No hay alquileres registrados para este inventario"}
+    
+    r_data = rentals.data[0]
 
     supabase.table("payment").insert({
-        "customer_id": c_id,
-        "staff_id": s_id,
-        "rental_id": payment.rental_id,
+        "customer_id": r_data["customer_id"],
+        "staff_id": r_data["staff_id"],
+        "rental_id": r_data["rental_id"],
         "amount": payment.amount
     }).execute()
 
-    return {"status": "success"}
-
-# 6. AGREGAR CLIENTE DIRECTAMENTE EN SUPABASE DESDE JAVA
-@app.post("/customers")
-def agregar_cliente(customer: CustomerInput):
-    supabase.table("customer").insert({
-        "store_id": customer.store_id,
-        "first_name": customer.first_name,
-        "last_name": customer.last_name,
-        "email": customer.email,
-        "active": True
-    }).execute()
     return {"status": "success"}
 
 if __name__ == "__main__":
